@@ -1,0 +1,279 @@
+diff --git a/backend/cmd/headlamp.go b/backend/cmd/headlamp.go
+index a0b1e9f2b..b9adfc9b5 100644
+--- a/backend/cmd/headlamp.go
++++ b/backend/cmd/headlamp.go
+@@ -82,6 +82,7 @@ type HeadlampConfig struct {
+ 	oidcSkipTLSVerify         bool
+ 	oidcCACert                string
+ 	oidcUsePKCE               bool
++	oidcDebug                 bool
+ 	cache                     cache.Cache[interface{}]
+ 	multiplexer               *Multiplexer
+ 	telemetryConfig           cfg.Config
+@@ -774,6 +775,11 @@ func createHeadlampHandler(config *HeadlampConfig) http.Handler {
+ 	r.HandleFunc("/oidc-callback", func(w http.ResponseWriter, r *http.Request) {
+ 		state := r.URL.Query().Get("state")
+ 
++		if config.oidcDebug {
++			logger.Log(logger.LevelDebug, map[string]string{"endpoint": "/oidc-callback"}, nil,
++				"OIDC callback received")
++		}
++
+ 		if state == "" {
+ 			logger.Log(logger.LevelError, nil, err, "invalid request state is empty")
+ 			http.Error(w, "invalid request state is empty", http.StatusBadRequest)
+@@ -791,6 +797,14 @@ func createHeadlampHandler(config *HeadlampConfig) http.Handler {
+ 
+ 		oauthMu.Unlock()
+ 
++		if config.oidcDebug && ok {
++			statePreview := state
++			if len(state) > 8 {
++				statePreview = state[:8] + "..."
++			}
++			logger.Log(logger.LevelDebug, map[string]string{"state": statePreview}, nil, "OIDC state validated successfully")
++		}
++
+ 		if !ok {
+ 			http.Error(w, "invalid request", http.StatusBadRequest)
+ 			return
+@@ -817,12 +831,26 @@ func createHeadlampHandler(config *HeadlampConfig) http.Handler {
+ 		}
+ 
+ 		if err != nil {
+-			logger.Log(logger.LevelError, nil, err, "failed to exchange token")
++			logger.Log(logger.LevelError, map[string]string{
++				"endpoint": oauthConfig.Config.Endpoint.TokenURL,
++			}, err, "failed to exchange authorization code for token")
+ 			http.Error(w, "Failed to exchange token: "+err.Error(), http.StatusInternalServerError)
+ 
+ 			return
+ 		}
+ 
++		if config.oidcDebug {
++			hasRefresh := "false"
++			if oauth2Token.RefreshToken != "" {
++				hasRefresh = "true"
++			}
++			logger.Log(logger.LevelDebug, map[string]string{
++				"token_type":  tokenType,
++				"has_refresh": hasRefresh,
++				"expires_in":  oauth2Token.Expiry.Sub(time.Now()).String(),
++			}, nil, "Token exchange successful")
++		}
++
+ 		tokenType := "id_token"
+ 		if config.oidcUseAccessToken {
+ 			tokenType = "access_token"
+@@ -830,7 +858,9 @@ func createHeadlampHandler(config *HeadlampConfig) http.Handler {
+ 
+ 		rawUserToken, ok := oauth2Token.Extra(tokenType).(string)
+ 		if !ok {
+-			logger.Log(logger.LevelError, nil, err, fmt.Sprintf("no %s field in oauth2 token", tokenType))
++			logger.Log(logger.LevelError, map[string]string{
++				"token_type": tokenType,
++			}, err, fmt.Sprintf("no %s field in oauth2 token", tokenType))
+ 			http.Error(w, fmt.Sprintf("No %s field in oauth2 token.", tokenType), http.StatusInternalServerError)
+ 
+ 			return
+@@ -846,24 +876,48 @@ func createHeadlampHandler(config *HeadlampConfig) http.Handler {
+ 
+ 		idToken, err := oauthConfig.Verifier.Verify(oauthConfig.Ctx, rawUserToken)
+ 		if err != nil {
+-			logger.Log(logger.LevelError, nil, err, "failed to verify ID Token")
++			logger.Log(logger.LevelError, map[string]string{
++				"issuer": oauthConfig.Verifier.Issuer(),
++			}, err, "failed to verify ID Token signature")
+ 			http.Error(w, "Failed to verify ID Token: "+err.Error(), http.StatusInternalServerError)
+ 
+ 			return
+ 		}
+ 
++		if config.oidcDebug {
++			logger.Log(logger.LevelDebug, map[string]string{
++				"subject": idToken.Subject,
++				"issuer":  idToken.Issuer,
++				"expiry":  idToken.Expiry.Format(time.RFC3339),
++			}, nil, "ID Token verified successfully")
++		}
++
+ 		resp := struct {
+ 			OAuth2Token   *oauth2.Token
+ 			IDTokenClaims *json.RawMessage // ID Token payload is just JSON.
+ 		}{oauth2Token, new(json.RawMessage)}
+ 
+ 		if err := idToken.Claims(&resp.IDTokenClaims); err != nil {
+-			logger.Log(logger.LevelError, nil, err, "failed to get id token claims")
++			logger.Log(logger.LevelError, nil, err, "failed to extract claims from ID token")
+ 			http.Error(w, err.Error(), http.StatusInternalServerError)
+ 
+ 			return
+ 		}
+ 
++		if config.oidcDebug {
++			var claimsMap map[string]interface{}
++			if err := json.Unmarshal(*resp.IDTokenClaims, &claimsMap); err == nil {
++				logData := map[string]string{}
++				if email, ok := claimsMap["email"].(string); ok && email != "" {
++					logData["user_email"] = email
++				}
++				if name, ok := claimsMap["name"].(string); ok && name != "" {
++					logData["user_name"] = name
++				}
++				logger.Log(logger.LevelDebug, logData, nil, "User claims extracted successfully")
++			}
++		}
++
+ 		var redirectURL string
+ 		if config.DevMode {
+ 			redirectURL = "http://localhost:3000/"
+@@ -879,6 +933,13 @@ func createHeadlampHandler(config *HeadlampConfig) http.Handler {
+ 		// Set auth cookie
+ 		auth.SetTokenCookie(w, r, oauthConfig.Cluster, rawUserToken, config.BaseURL)
+ 
++		if config.oidcDebug {
++			logger.Log(logger.LevelDebug, map[string]string{
++				"cluster":  oauthConfig.Cluster,
++				"redirect": redirectURL,
++			}, nil, "OIDC login completed, redirecting to UI")
++		}
++
+ 		redirectURL += fmt.Sprintf("auth?cluster=%1s", oauthConfig.Cluster)
+ 
+ 		http.Redirect(w, r, redirectURL, http.StatusSeeOther)
+@@ -927,6 +988,13 @@ func (c *HeadlampConfig) refreshAndSetToken(oidcAuthConfig *kubeconfig.OidcConfi
+ 	cache cache.Cache[interface{}], token string,
+ 	w http.ResponseWriter, r *http.Request, cluster string, span trace.Span, ctx context.Context,
+ ) {
++	if c.oidcDebug {
++		logger.Log(logger.LevelDebug, map[string]string{
++			"cluster": cluster,
++			"action":  "refresh_token",
++		}, nil, "Attempting to refresh OIDC token")
++	}
++
+ 	// The token type to use
+ 	tokenType := "id_token"
+ 	if c.oidcUseAccessToken {
+@@ -941,17 +1009,32 @@ func (c *HeadlampConfig) refreshAndSetToken(oidcAuthConfig *kubeconfig.OidcConfi
+ 	newToken, err := auth.RefreshAndCacheNewToken(
+ 		ctx,
+ 		oidcAuthConfig,
++		c.oidcDebug,
+ 		cache,
+ 		tokenType,
+ 		token,
+ 		idpIssuerURL,
+ 	)
+ 	if err != nil {
+-		logger.Log(logger.LevelError, map[string]string{"cluster": cluster},
+-			err, "failed to refresh token")
++		logger.Log(logger.LevelError, map[string]string{
++			"cluster": cluster,
++			"issuer":  idpIssuerURL,
++		}, err, "failed to refresh OIDC token")
+ 		c.telemetryHandler.RecordError(span, err, "Token refresh failed")
+ 		c.telemetryHandler.RecordErrorCount(ctx, attribute.String("error", "token_refresh_failure"))
++
++		if c.oidcDebug {
++			logger.Log(logger.LevelDebug, nil, nil,
++				"Token refresh failed - user may need to re-authenticate")
++		}
+ 	} else if newToken != nil {
++		if c.oidcDebug {
++			logger.Log(logger.LevelDebug, map[string]string{
++				"cluster":    cluster,
++				"new_expiry": newToken.Expiry.Format(time.RFC3339),
++			}, nil, "Token refreshed successfully")
++		}
++
+ 		var newTokenString string
+ 		if c.oidcUseAccessToken {
+ 			newTokenString = newToken.Extra("access_token").(string)
+diff --git a/backend/pkg/auth/auth.go b/backend/pkg/auth/auth.go
+index 0c4689a6f..fc961c267 100644
+--- a/backend/pkg/auth/auth.go
++++ b/backend/pkg/auth/auth.go
+@@ -204,6 +204,17 @@ func GetNewToken(clientID, clientSecret string, cache cache.Cache[interface{}],
+ 		return nil, fmt.Errorf("caching refreshed token: %v", err)
+ 	}
+ 
++	if debugEnabled {
++		hasRefresh := "false"
++		if newToken.RefreshToken != "" {
++			hasRefresh = "true"
++		}
++		logger.Log(logger.LevelDebug, map[string]string{
++			"has_refresh": hasRefresh,
++			"expires_in":  newToken.Expiry.Sub(time.Now()).String(),
++		}, nil, "New token obtained from provider")
++	}
++
+ 	return newToken, nil
+ }
+ 
+@@ -246,12 +257,18 @@ func ConfigureTLSContext(ctx context.Context, skipTLSVerify *bool, caCert *strin
+ // RefreshAndCacheNewToken obtains a fresh OIDC token using the cached refresh token
+ // and re-populates the cache so subsequent requests can reuse it. The provided ctx
+ // controls cancellation and deadlines for all outbound requests during the refresh.
+-func RefreshAndCacheNewToken(ctx context.Context, oidcAuthConfig *kubeconfig.OidcConfig,
++func RefreshAndCacheNewToken(ctx context.Context, oidcAuthConfig *kubeconfig.OidcConfig, debugEnabled bool,
+ 	cache cache.Cache[interface{}],
+ 	tokenType, token, issuerURL string,
+ ) (*oauth2.Token, error) {
+ 	ctx = ConfigureTLSContext(ctx, oidcAuthConfig.SkipTLSVerify, oidcAuthConfig.CACert)
+ 
++	if debugEnabled {
++		logger.Log(logger.LevelDebug, map[string]string{
++			"issuer":    issuerURL,
++			"client_id": oidcAuthConfig.ClientID,
++		}, nil, "Initiating token refresh with identity provider")
++	}
+ 	// get provider
+ 	provider, err := oidc.NewProvider(ctx, issuerURL)
+ 	if err != nil {
+diff --git a/backend/pkg/config/config.go b/backend/pkg/config/config.go
+index b3193d7bc..5a581d2f7 100644
+--- a/backend/pkg/config/config.go
++++ b/backend/pkg/config/config.go
+@@ -63,6 +63,7 @@ type Config struct {
+ 	OidcUseAccessToken        bool   `koanf:"oidc-use-access-token"`
+ 	OidcSkipTLSVerify         bool   `koanf:"oidc-skip-tls-verify"`
+ 	OidcCAFile                string `koanf:"oidc-ca-file"`
++	OidcDebug                 bool   `koanf:"oidc-debug"`
+ 	MeUsernamePath            string `koanf:"me-username-path"`
+ 	MeEmailPath               string `koanf:"me-email-path"`
+ 	MeGroupsPath              string `koanf:"me-groups-path"`
+@@ -444,6 +445,7 @@ func addOIDCFlags(f *flag.FlagSet) {
+ 	f.String("oidc-ca-file", "", "CA file for OIDC")
+ 	f.Bool("oidc-use-access-token", false, "Setup oidc to pass through the access_token instead of the default id_token")
+ 	f.Bool("oidc-use-pkce", false, "Use PKCE (Proof Key for Code Exchange) for enhanced security in OIDC flow")
++	f.Bool("oidc-debug", false, "Enable verbose debug logging for OIDC authentication flow")
+ 	f.String("me-username-path", DefaultMeUsernamePath,
+ 		"Comma separated JMESPath expressions used to read username from the JWT payload")
+ 	f.String("me-email-path", DefaultMeEmailPath,
+diff --git a/backend/pkg/logger/logger.go b/backend/pkg/logger/logger.go
+index 20615ded2..322443d1a 100644
+--- a/backend/pkg/logger/logger.go
++++ b/backend/pkg/logger/logger.go
+@@ -24,8 +24,10 @@ import (
+ )
+ 
+ const (
++	// LevelDebug is the debug level.
++	LevelDebug = iota
+ 	// LevelInfo is the info level.
+-	LevelInfo = iota
++	LevelInfo
+ 	// LevelWarn is the warn level.
+ 	LevelWarn
+ 	// LevelError is the error level.
+@@ -53,6 +55,8 @@ func log(level uint, str map[string]string, err interface{}, msg string) {
+ 	var event *zerolog.Event
+ 
+ 	switch level {
++	case LevelDebug:
++		event = zlog.Debug()
+ 	case LevelInfo:
+ 		event = zlog.Info()
+ 	case LevelWarn:
