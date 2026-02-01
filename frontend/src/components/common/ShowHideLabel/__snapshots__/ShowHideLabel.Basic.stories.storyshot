@@ -7,7 +7,6 @@
         class="MuiBox-root css-k008qs"
       >
         <label
-          aria-expanded="false"
           id="label-id"
           style="word-break: break-all; white-space: normal;"
         >
@@ -15,6 +14,7 @@
           …
           <button
             aria-controls="label-id"
+            aria-expanded="false"
             arial-label="Expand"
             class="MuiButtonBase-root MuiIconButton-root MuiIconButton-sizeSmall css-z81te2-MuiButtonBase-root-MuiIconButton-root"
             tabindex="0"
